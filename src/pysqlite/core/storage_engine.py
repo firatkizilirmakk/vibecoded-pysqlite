@@ -1,7 +1,6 @@
 import os
 import pickle
 import struct
-import shutil
 from .locking import Locker
 
 PAGE_SIZE = 4096
