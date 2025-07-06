@@ -1,0 +1,32 @@
+# This file specifies the build system and project metadata.
+# It's the modern standard for Python packaging.
+
+[build-system]
+# This tells build tools like pip and uv that our project needs setuptools
+# to be built. Setuptools is the classic and most common build backend.
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# --- Core Metadata ---
+name = "py-sqlite-engine"
+version = "1.0.0"
+description = "A SQLite-like relational database built from scratch in Python."
+readme = "README.md" # Specifies the README file for the long description
+requires-python = ">=3.6"
+license = { text = "MIT License" } # Example license
+
+# --- Author and Project Links ---
+[project.urls]
+Homepage = "https://github.com/firatkizilirmakk/vibecoded-pysqlite/" # You can change this
+"Bug Tracker" = "https://github.com/firatkizilirmakk/vibecoded-pysqlite/issues"
+
+# --- Entry Point for the Command-Line Script ---
+# This section replaces the 'entry_points' dictionary from setup.py
+[project.scripts]
+pysqlite = "pysqlite.cli:main"
+
+[tool.setuptools]
+# This tells setuptools where to find the package source code.
+# It replaces the package_dir and find_packages() from setup.py.
+package-dir = {"" = "src"}
