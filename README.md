@@ -1,5 +1,7 @@
 # py-sqlite: A Relational Database from Scratch in Python
 
+a pure vibecoding or context engineering :D based sqlite implementation in python.
+
 py-sqlite is a custom-built, SQLite-like relational database written entirely in Python. This project was developed as a step-by-step exploration of the core components of a database management system, from low-level file I/O and data structures to a high-level SQL query processor.
 
 It features a persistent, page-based storage engine using B-Trees for efficient indexing, a recursive-descent SQL parser, and a query execution engine with a simple optimizer. Most importantly, it is **fully ACID compliant**, ensuring data integrity through atomic transactions and file locking.
