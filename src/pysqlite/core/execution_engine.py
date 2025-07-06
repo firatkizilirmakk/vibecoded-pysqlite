@@ -8,10 +8,32 @@ class ExecutionEngine:
 
     def __init__(self, storage_engine):
         self.storage_engine = storage_engine
+        self.in_transaction = False
 
     def execute(self, parsed_command, data_context=None):
         command_type = parsed_command.get('type')
         data_context = data_context or {}
+        if command_type == 'BEGIN':
+            return self._execute_begin()
+        if command_type == 'COMMIT':
+            return self._execute_commit()
+        if command_type == 'ROLLBACK':
+            return self._execute_rollback()
+        
+        is_write_operation = command_type in ['UPDATE', 'DELETE', 'CREATE_INDEX', 'CREATE_TABLE', 'INSERT']
+        if is_write_operation and not self.in_transaction:
+            self._execute_begin()
+            try:
+                result = self._dispatch_command(command_type, parsed_command, data_context)
+                self._execute_commit()
+                return result
+            except Exception as e:
+                self._execute_rollback()
+                raise e
+        else:
+            return self._dispatch_command(command_type, parsed_command, data_context)
+
+    def _dispatch_command(self, command_type, parsed_command, data_context):
         if command_type == 'UPDATE':
             return self._execute_update(parsed_command)
         if command_type == 'DELETE':
@@ -19,7 +41,7 @@ class ExecutionEngine:
         if command_type == 'CREATE_INDEX':
             return self._execute_create_index(parsed_command)
         if command_type == 'WITH':
-            return self._execute_with(parsed_command)
+            return self._execute_with(parsed_command, data_context)
         if command_type == 'CREATE_TABLE':
             return self._execute_create_table(parsed_command)
         if command_type == 'INSERT':
@@ -28,40 +50,107 @@ class ExecutionEngine:
             return self._execute_select(parsed_command, data_context)
         raise ValueError(f"Unsupported command type: {command_type}")
 
+    def _execute_begin(self):
+        if self.in_transaction:
+            raise ValueError("Transaction already in progress.")
+        self.storage_engine.begin_transaction()
+        self.in_transaction = True
+        return "Transaction started."
+
+    def _execute_commit(self):
+        if not self.in_transaction:
+            raise ValueError("No transaction to commit.")
+        self.storage_engine.commit_transaction()
+        self.in_transaction = False
+        return "Transaction committed."
+
+    def _execute_rollback(self):
+        if not self.in_transaction:
+            raise ValueError("No transaction to roll back.")
+        self.storage_engine.rollback_transaction()
+        self.in_transaction = False
+        return "Transaction rolled back."
+
+    def _execute_update(self, command):
+        table_name, where_clause, set_values = command['table_name'], command.get('where'), command['set']
+        records_to_update = self._find_records_for_modification(table_name, where_clause)
+        if not records_to_update:
+            return "0 rows updated."
+        metadata = self.storage_engine.get_table_metadata(table_name)
+        primary_key_col = metadata['primary_key']
+        for record in records_to_update:
+            pk_value = record.get(primary_key_col)
+            self.storage_engine.update_record(table_name, pk_value, set_values)
+        return f"{len(records_to_update)} row(s) updated."
+
+    def _execute_delete(self, command):
+        table_name, where_clause = command['table_name'], command.get('where')
+        if not where_clause:
+            raise ValueError("DELETE statement must have a WHERE clause (for safety).")
+        records_to_delete = self._find_records_for_modification(table_name, where_clause)
+        if not records_to_delete:
+            return "0 rows deleted."
+        metadata = self.storage_engine.get_table_metadata(table_name)
+        primary_key_col = metadata['primary_key']
+        for record in records_to_delete:
+            pk_value = record.get(primary_key_col)
+            self.storage_engine.delete_record(table_name, pk_value, record)
+        return f"{len(records_to_delete)} row(s) deleted."
+
+    def _find_records_for_modification(self, table_name, where_clause):
+        select_command = {'from': {'type': 'table', 'name': table_name}, 'columns': [{'type': 'wildcard'}], 'where': where_clause}
+        return self._execute_select(select_command, data_context={})
+    
     def _execute_select(self, command, data_context):
         from_clause = command['from']
         where_clause = command.get('where')
-        
-        # Step 1: Get the initial set of rows from the FROM clause.
-        # This is the main source of data, either a single table or a join result.
-        if from_clause['type'] == 'join':
-            initial_records = self._execute_join(from_clause, data_context)
-        else:
-            # For single tables, we do a full scan. Filtering happens next.
-            initial_records = self._full_scan_with_filter(from_clause['name'], None, data_context)
-        
-        # Step 2: Apply the full WHERE clause to the initial set of records.
+        initial_records = []
+        can_use_index = (where_clause and from_clause['type'] == 'table' and where_clause['type'] != 'OR')
+        index_used = False
+        if can_use_index:
+            table_name = from_clause['name']
+            index_check_condition = None
+            if where_clause['type'] == 'condition':
+                index_check_condition = where_clause
+            elif where_clause['type'] == 'AND':
+                index_check_condition = where_clause['conditions'][0]
+            if index_check_condition and index_check_condition['operator'] == '=':
+                try:
+                    metadata = self.storage_engine.get_table_metadata(table_name)
+                    where_col = index_check_condition['column']
+                    if where_col == metadata['primary_key']:
+                        record = self.storage_engine.search_pk(table_name, index_check_condition['value'])
+                        if record:
+                            initial_records = [record]
+                        index_used = True
+                    else:
+                        for index_name, column_name in metadata['indexes'].items():
+                            if where_col == column_name:
+                                pk_value = self.storage_engine.search_index(index_name, index_check_condition['value'])
+                                if pk_value:
+                                    record = self.storage_engine.search_pk(table_name, pk_value)
+                                    if record:
+                                        initial_records = [record]
+                                index_used = True
+                                break
+                except FileNotFoundError:
+                     raise ValueError(f"Table '{table_name}' does not exist.")
+        if not index_used:
+            if from_clause['type'] == 'join':
+                initial_records = self._execute_join(from_clause, data_context)
+            else:
+                initial_records = self._full_scan_with_filter(from_clause['name'], None, data_context)
         results = self._full_scan_with_filter(None, where_clause, records_to_filter=initial_records)
-        
-        # The rest of the pipeline (GROUP BY, ORDER BY, etc.) runs on the filtered results.
-        select_parts = command['columns']
-        group_by_cols = command.get('group_by')
-        order_by = command.get('order_by')
-
+        select_parts, group_by_cols, order_by = command['columns'], command.get('group_by'), command.get('order_by')
         if group_by_cols:
             results = self._perform_grouping(select_parts, group_by_cols, results)
         else:
             if any(p['type'] == 'aggregate' for p in select_parts):
                 results = self._perform_aggregation(select_parts, results)
-        
-        # Final projection of columns
         if not any(p['type'] == 'aggregate' for p in select_parts):
             results = self._project_columns(results, select_parts)
-
         if order_by and results:
             sort_column = order_by['column']
-            # For joins, the sort column might be prefixed (e.g., 'employees.name')
-            # We need to find the actual key in the result dictionary.
             actual_sort_key = None
             for key in results[0].keys():
                 if key.endswith(f".{sort_column}") or key == sort_column:
@@ -70,31 +159,18 @@ class ExecutionEngine:
             if not actual_sort_key:
                 raise ValueError(f"Cannot order by column '{sort_column}' as it is not in the final result set.")
             results.sort(key=lambda x: x[actual_sort_key], reverse=(order_by['direction'] == 'DESC'))
-            
         return results
 
     def _execute_join(self, join_clause, data_context):
-        """
-        Performs a Nested Loop Join for INNER and LEFT JOIN.
-        """
-        left_table_name = join_clause['left']['name']
-        right_table_name = join_clause['right']['name']
-        on_cond = join_clause['on']
-        join_type = join_clause['join_type']
-
+        left_table_name, right_table_name, on_cond, join_type = join_clause['left']['name'], join_clause['right']['name'], join_clause['on'], join_clause['join_type']
         left_records = self._full_scan_with_filter(left_table_name, None, data_context)
         right_records = self._full_scan_with_filter(right_table_name, None, data_context)
-
         joined_records = []
-        
-        # Get schema for the right table to create null placeholders for LEFT JOIN
         right_schema = self.storage_engine.get_table_metadata(right_table_name)['schema']
         null_right_row = {f"{right_table_name}.{col}": None for col in right_schema}
-
         for l_row in left_records:
             match_found = False
             for r_row in right_records:
-                # Check if the ON condition is met
                 if l_row.get(on_cond['left_column']) == r_row.get(on_cond['right_column']):
                     match_found = True
                     new_row = {}
@@ -103,15 +179,12 @@ class ExecutionEngine:
                     for col, val in r_row.items():
                         new_row[f"{right_table_name}.{col}"] = val
                     joined_records.append(new_row)
-            
-            # For LEFT JOIN, if no match was found for the left row, add it with nulls for the right side
             if not match_found and join_type == 'LEFT':
                 new_row = {}
                 for col, val in l_row.items():
                     new_row[f"{left_table_name}.{col}"] = val
                 new_row.update(null_right_row)
                 joined_records.append(new_row)
-        
         return joined_records
 
     def _project_columns(self, records, select_parts):
@@ -124,10 +197,8 @@ class ExecutionEngine:
             new_record = {}
             for part in select_parts:
                 if part['type'] == 'column':
-                    # Handle table.column syntax for joined results
                     col_key = f"{part['table']}.{part['name']}" if part['table'] else part['name']
                     val_found = False
-                    # Search for exact match or prefixed match
                     if col_key in record:
                         new_record[col_key] = record[col_key]
                         val_found = True
@@ -138,7 +209,7 @@ class ExecutionEngine:
                                 val_found = True
                                 break
                     if not val_found:
-                        new_record[part['name']] = None # Column not found
+                        new_record[part['name']] = None
             projected_records.append(new_record)
         return projected_records
 
@@ -157,10 +228,8 @@ class ExecutionEngine:
              raise ValueError("No records provided for filtering.")
         else:
             return []
-
         if not where_clause:
             return list(all_records)
-
         filtered_records = []
         for record in all_records:
             if self._evaluate_where_clause(record, where_clause):
@@ -169,23 +238,17 @@ class ExecutionEngine:
 
     def _evaluate_where_clause(self, record, clause):
         clause_type = clause.get('type')
-        
         if clause_type == 'OR':
             return any(self._evaluate_where_clause(record, cond) for cond in clause['conditions'])
-        
         if clause_type == 'AND':
             return all(self._evaluate_where_clause(record, cond) for cond in clause['conditions'])
-        
         if clause_type == 'condition':
             ops = {'=': op.eq, '!=': op.ne, '<': op.lt, '<=': op.le, '>': op.gt, '>=': op.ge}
             op_func = ops.get(clause['operator'])
             if not op_func:
                 return False
-            
             col_name_full = clause['column']
-            # Find the value in the potentially prefixed record keys
-            record_val = None
-            val_found = False
+            record_val, val_found = None, False
             if col_name_full in record:
                 record_val = record[col_name_full]
                 val_found = True
@@ -197,51 +260,21 @@ class ExecutionEngine:
                         break
             if not val_found:
                 return False
-
             if record_val is None:
                 return False
-            
             try:
                 return op_func(record_val, clause['value'])
             except TypeError:
                 return False
-        
         return False
-
-    def _execute_update(self, command):
-        table_name, where_clause, set_values = command['table_name'], command.get('where'), command['set']
-        # For UPDATE/DELETE, we must do a full scan of the single table
-        records_to_modify = self._full_scan_with_filter(table_name, where_clause)
-        if not records_to_modify:
-            return "0 rows updated."
-        metadata = self.storage_engine.get_table_metadata(table_name)
-        primary_key_col = metadata['primary_key']
-        for record in records_to_modify:
-            pk_value = record.get(primary_key_col)
-            self.storage_engine.update_record(table_name, pk_value, set_values)
-        return f"{len(records_to_modify)} row(s) updated."
-
-    def _execute_delete(self, command):
-        table_name, where_clause = command['table_name'], command.get('where')
-        if not where_clause:
-            raise ValueError("DELETE statement must have a WHERE clause (for safety).")
-        records_to_delete = self._full_scan_with_filter(table_name, where_clause)
-        if not records_to_delete:
-            return "0 rows deleted."
-        metadata = self.storage_engine.get_table_metadata(table_name)
-        primary_key_col = metadata['primary_key']
-        for record in records_to_delete:
-            pk_value = record.get(primary_key_col)
-            self.storage_engine.delete_record(table_name, pk_value, record)
-        return f"{len(records_to_delete)} row(s) deleted."
 
     def _execute_create_index(self, command):
         index_name, table_name, column_name = command['index_name'], command['table_name'], command['column_name']
         self.storage_engine.create_index(index_name, table_name, column_name)
         return f"Index '{index_name}' created on table '{table_name}'."
 
-    def _execute_with(self, command):
-        new_data_context = {}
+    def _execute_with(self, command, data_context):
+        new_data_context = data_context.copy()
         for cte in command['ctes']:
             cte_result = self.execute(cte['query'], data_context=new_data_context)
             new_data_context[cte['name']] = cte_result
@@ -267,7 +300,6 @@ class ExecutionEngine:
         return "1 row inserted."
 
     def _perform_grouping(self, select_parts, group_by_cols, records):
-        # ... (unchanged)
         selected_cols = {p['name'] for p in select_parts if p['type'] == 'column'}
         if not selected_cols.issubset(set(group_by_cols)):
             raise ValueError("Selected column is not in GROUP BY clause and is not an aggregate function.")
@@ -285,7 +317,6 @@ class ExecutionEngine:
         return final_results
 
     def _perform_aggregation(self, aggregates, records):
-        # ... (unchanged)
         if not records and any(agg['function'] != 'COUNT' for agg in aggregates):
             return [{agg['alias']: None for agg in aggregates}]
         result_row = {}

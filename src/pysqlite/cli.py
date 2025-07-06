@@ -63,7 +63,7 @@ def main():
     parser = Parser()
     engine = ExecutionEngine(storage)
 
-    print("pysqlite version 1.2.0")
+    print("pysqlite version 1.0.0")
     print(f"Connected to database at '{os.path.abspath(db_dir)}'.")
     print("Enter '.exit' to quit or '.tables' to list tables.")
 
@@ -88,7 +88,7 @@ def main():
                 continue
             
             parsed_command = parser.parse(query)
-            result = engine.execute(parsed_command, data_context={})
+            result = engine.execute(parsed_command)
 
             if result is not None:
                 if isinstance(result, list):
